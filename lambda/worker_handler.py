@@ -46,7 +46,6 @@ def _update_fields(request_id: str, *, status=None, result=None, error=None):
         vals[":r"] = result
 
     if error is not None:
-        # DO NOT use DynamoDB reserved word "error" as an attribute name
         expr.append("#em = :e")
         names["#em"] = "error_message"
         vals[":e"] = str(error)
@@ -86,7 +85,6 @@ def _wait_vpc_available(vpc_id: str, timeout_seconds: int = 30):
 def handle_request(request_id: str):
     item = _get_request(request_id)
 
-    # terminal states
     if item.get("status") in ("CREATED", "FAILED"):
         return
 
@@ -98,7 +96,6 @@ def handle_request(request_id: str):
         _update_fields(request_id, status="FAILED", error=f"Too many subnets: {len(subnets_req)} (max {MAX_SUBNETS})")
         return
 
-    # Get current result checkpoint if any
     current_result = item.get("result") or {}
     vpc_id = current_result.get("vpc_id")
     created_subnets = current_result.get("subnets") or []  # list of dicts
@@ -107,28 +104,22 @@ def handle_request(request_id: str):
     _update_fields(request_id, status="IN_PROGRESS")
 
     try:
-        # 1) VPC (idempotent)
         if not vpc_id:
             vpc_cidr = vpc_req["cidr"]
             vpc_resp = ec2.create_vpc(CidrBlock=vpc_cidr)
             vpc_id = vpc_resp["Vpc"]["VpcId"]
             _tag([vpc_id], request_id)
             _wait_vpc_available(vpc_id)
-
-            # checkpoint immediately so retries won't create another VPC
             current_result.update({
                 "vpc_id": vpc_id,
                 "vpc_cidr": vpc_cidr,
                 "subnets": created_subnets,
             })
             _update_fields(request_id, result=current_result)
-
-        # 2) Subnets (idempotent by (cidr, az))
         for s in subnets_req:
             key = (s["cidr"], s["az"])
             if key in created_by_key:
                 continue
-
             sn_resp = ec2.create_subnet(
                 VpcId=vpc_id,
                 CidrBlock=s["cidr"],
@@ -150,8 +141,6 @@ def handle_request(request_id: str):
                 "name": s.get("name"),
             })
             created_by_key.add(key)
-
-            # checkpoint after each subnet
             current_result["subnets"] = created_subnets
             _update_fields(request_id, result=current_result)
 
