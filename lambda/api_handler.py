@@ -12,10 +12,7 @@ from botocore.exceptions import ClientError
 from decimal import Decimal
 
 def _json_default(o):
-    # DynamoDB uses Decimal for all numbers
     if isinstance(o, Decimal):
-        # ttl_epoch is an integer, so int is safe.
-        # If you later store non-integers, you can switch to float(o).
         return int(o)
     raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
 
@@ -142,8 +139,6 @@ def _route(event: dict) -> tuple[str, str]:
 
 
 def _lock_pk(created_by: str, idem: str) -> str:
-    # lock item PK is derived from caller identity + idempotency key.
-    # We do NOT store created_by on the lock record.
     return f"lock#{created_by}#{idem}"
 
 
@@ -175,7 +170,6 @@ def handle_post_vpcs(event: dict):
     lock_key = _lock_pk(created_by, idem)
     request_id = str(uuid.uuid4())
 
-    # Acquire idempotency lock (race-proof)
     try:
         table.put_item(
             Item={
@@ -201,7 +195,6 @@ def handle_post_vpcs(event: dict):
         existing_request_id = lock["lock_request_id"]
         existing = table.get_item(Key={"request_id": existing_request_id}).get("Item")
 
-        # Always 202 for idempotent replay
         if not existing:
             return _resp(202, {"request_id": existing_request_id, "status": "QUEUED"})
 
@@ -212,7 +205,6 @@ def handle_post_vpcs(event: dict):
             "error_message": existing.get("error_message"),
         })
 
-    # Create the request record (includes created_by for audit)
     table.put_item(Item={
         "request_id": request_id,
         "type": "VPC_REQUEST",
@@ -251,9 +243,6 @@ def handle_get_vpcs(event: dict):
         except Exception:
             return _resp(400, {"message": "Invalid next_token"})
 
-    # Option A: list ALL requests (authenticated users can see everything).
-    # Since the table PK is request_id, we use Scan with pagination.
-    # We filter to return only VPC_REQUEST items (exclude idempotency lock items).
     scan_kwargs = {
         "Limit": limit,
         "FilterExpression": "attribute_exists(#t) AND #t = :v",
