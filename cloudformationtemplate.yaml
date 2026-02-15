@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "demo - VPC provisioning API (HTTP API + Cognito JWT + DynamoDB + SQS + 2 Lambdas)"
+
+Parameters:
+  CodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing Lambda zips
+  ApiZipKey:
+    Type: String
+    Description: S3 key for demo-api.zip
+  WorkerZipKey:
+    Type: String
+    Description: S3 key for demo-worker.zip
+
+Resources:
+  DemoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: demo
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: request_id
+          AttributeType: S
+        - AttributeName: created_by
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: request_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: demo-createdby-createdat
+          KeySchema:
+            - AttributeName: created_by
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl_epoch
+        Enabled: true
+
+  DemoDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: demo-dlq
+
+  DemoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: demo
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DemoDlq.Arn
+        maxReceiveCount: 5
+
+  DemoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: demo
+
+  DemoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: demo
+      UserPoolId: !Ref DemoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  DemoApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: demo-api
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: demo-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: TableRw
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Scan]
+                Resource: !GetAtt DemoTable.Arn
+              - Sid: EnqueueWork
+                Effect: Allow
+                Action: [sqs:SendMessage]
+                Resource: !GetAtt DemoQueue.Arn
+
+  DemoWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: demo-worker
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: demo-worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DdbReadWriteStatus
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt DemoTable.Arn
+              - Sid: Ec2VpcSubnetCreate
+                Effect: Allow
+                Action:
+                  - ec2:CreateVpc
+                  - ec2:CreateSubnet
+                  - ec2:CreateTags
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                Resource: "*"
+              - Sid: SqsConsume
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt DemoQueue.Arn
+
+  DemoApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: demo-api
+      Role: !GetAtt DemoApiRole.Arn
+      Runtime: python3.11
+      Handler: api_handler.lambda_handler
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref ApiZipKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DemoTable
+          QUEUE_URL: !Ref DemoQueue
+
+  DemoWorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: demo-worker
+      Role: !GetAtt DemoWorkerRole.Arn
+      Runtime: python3.11
+      Handler: worker_handler.lambda_handler
+      Timeout: 180
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref WorkerZipKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DemoTable
+
+  DemoWorkerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt DemoQueue.Arn
+      FunctionName: !Ref DemoWorkerLambda
+
+  DemoHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: demo
+      ProtocolType: HTTP
+
+  DemoJwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref DemoHttpApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - "$request.header.Authorization"
+      Name: demo
+      JwtConfiguration:
+        Audience:
+          - !Ref DemoUserPoolClient
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${DemoUserPool}"
+
+  DemoApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DemoHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DemoApiLambda.Arn
+      PayloadFormatVersion: "2.0"
+
+  DemoRoutePostVpcs:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DemoHttpApi
+      RouteKey: "POST /vpcs"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref DemoJwtAuthorizer
+      Target: !Sub "integrations/${DemoApiIntegration}"
+
+  DemoRouteGetVpcs:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DemoHttpApi
+      RouteKey: "GET /vpcs"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref DemoJwtAuthorizer
+      Target: !Sub "integrations/${DemoApiIntegration}"
+
+  DemoRouteGetVpcsId:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DemoHttpApi
+      RouteKey: "GET /vpcs/{proxy+}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref DemoJwtAuthorizer
+      Target: !Sub "integrations/${DemoApiIntegration}"
+
+  DemoStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref DemoHttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  DemoApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DemoApiLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DemoHttpApi}/*/*/*"
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt DemoHttpApi.ApiEndpoint
+  UserPoolId:
+    Value: !Ref DemoUserPool
+  UserPoolClientId:
+    Value: !Ref DemoUserPoolClient
